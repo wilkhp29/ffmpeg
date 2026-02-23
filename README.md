@@ -1,6 +1,6 @@
 # FFmpeg Worker (URL mode) para Render
 
-Serviço HTTP em Bun + Express que recebe URLs de áudio/imagens, gera um vídeo vertical MP4 (1080x1920, 30fps) com FFmpeg e devolve o binário pronto para YouTube Shorts.
+Serviço HTTP em Bun + Express (TypeScript) que recebe URLs de áudio/imagens, gera um vídeo vertical MP4 (1080x1920, 30fps) com FFmpeg e devolve o binário pronto para YouTube Shorts.
 
 ## Recursos
 
@@ -16,6 +16,9 @@ Serviço HTTP em Bun + Express que recebe URLs de áudio/imagens, gera um vídeo
 - Slideshow via concat demuxer com repetição da última imagem quando o áudio é maior
 - Overlay de texto opcional (`drawtext`) com fallback automático sem texto se fonte/drawtext falhar
 - Mutex em memória: 1 job por vez (útil no plano free)
+- Limite de duração de áudio (default: `60s`) para reduzir risco de timeout/queda
+- Timeout de FFmpeg configurável (default: `180000ms`)
+- Resposta do vídeo em streaming (evita carregar o MP4 inteiro em memória)
 
 ## Estrutura
 
@@ -26,7 +29,7 @@ Serviço HTTP em Bun + Express que recebe URLs de áudio/imagens, gera um vídeo
 ├── Dockerfile
 ├── README.md
 ├── package.json
-└── server.js
+└── server.ts
 ```
 
 ## Contrato da API
@@ -50,6 +53,7 @@ Validações:
 - `audio_url` obrigatório
 - `image_urls` obrigatório (`1..10`)
 - `seconds_per_image` opcional (default `3`, aceito `> 0` e `<= 20`)
+- duração máxima de áudio (default `60s`)
 
 ## Rodando local com Docker
 
@@ -106,6 +110,12 @@ ffprobe -v error -show_entries stream=codec_name,width,height,r_frame_rate -of c
 8. Clique em **Create Web Service**.
 
 Render injeta `PORT` automaticamente. O servidor já usa `process.env.PORT`.
+
+Variáveis opcionais de runtime:
+- `MAX_AUDIO_DURATION_SEC` (default `60`)
+- `FFMPEG_TIMEOUT_MS` (default `180000`)
+- `FFMPEG_PRESET` (default `veryfast`)
+- `FFMPEG_PATH` e `FFPROBE_PATH` (opcional)
 
 ## Observações importantes
 

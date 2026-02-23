@@ -1,12 +1,13 @@
 {
   "name": "ffmpeg-worker-render",
   "version": "1.0.0",
-  "description": "FFmpeg Worker (URL mode) em Node.js para Render (Docker Web Service)",
-  "main": "server.js",
+  "description": "FFmpeg Worker (URL mode) em TypeScript para Render (Docker Web Service)",
+  "main": "server.ts",
   "type": "commonjs",
   "packageManager": "bun@1.2.22",
   "scripts": {
-    "start": "bun server.js"
+    "start": "bun server.ts",
+    "typecheck": "tsc --noEmit"
   },
   "keywords": [
     "ffmpeg",
@@ -15,6 +16,11 @@
     "docker"
   ],
   "license": "MIT",
+  "devDependencies": {
+    "@types/express": "^5.0.3",
+    "@types/node": "^24.3.0",
+    "typescript": "^5.9.2"
+  },
   "dependencies": {
     "express": "^4.21.2"
   }
