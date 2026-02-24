@@ -36,6 +36,17 @@ type DownloadResult = {
   contentType: string;
 };
 
+type DownloadAudioPartsOptions = {
+  audioUrls: string[];
+  workDir: string;
+  audioHeaders: Record<string, string>;
+};
+
+type DownloadAudioPartsResult = {
+  partPaths: string[];
+  totalBytes: number;
+};
+
 type CreateConcatFileOptions = {
   concatPath: string;
   imagePaths: string[];
@@ -112,6 +123,9 @@ const OUTPUT_CLEANUP_INTERVAL_MS = parsePositiveInteger(
 );
 const OUTPUT_ROOT = process.env.OUTPUT_ROOT || path.join(os.tmpdir(), 'ffmpeg-worker-outputs');
 const OUTPUT_BASE_URL = String(process.env.OUTPUT_BASE_URL || '').trim().replace(/\/+$/, '');
+const GOOGLE_TTS_BASE_URL =
+  'https://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob&tl=pt-BR&q=';
+const GOOGLE_TTS_MAX_CHARS = parsePositiveInteger(process.env.GOOGLE_TTS_MAX_CHARS, 180);
 
 const ALLOWED_AUDIO_TYPES = new Set(['audio/mpeg', 'application/octet-stream']);
 const ALLOWED_IMAGE_TYPES = new Set(['image/jpeg', 'image/png']);
@@ -205,26 +219,36 @@ app.post('/render', async (req: Request<unknown, unknown, RenderRequestBody>, re
     await ensureOutputRoot();
 
     const audioPath = path.join(workDir, 'audio.mp3');
-    const audioPartPaths: string[] = [];
-    let totalAudioBytes = 0;
+    let effectiveAudioUrls = [...audioUrls];
+    let audioSource: 'request' | 'google_fallback' = 'request';
 
-    for (let i = 0; i < audioUrls.length; i += 1) {
-      const audioPartPath = path.join(workDir, `audio_part_${String(i).padStart(3, '0')}.mp3`);
-      const audioDownload = await downloadToFile({
-        url: audioUrls[i],
-        destinationPath: audioPartPath,
-        allowedContentTypes: ALLOWED_AUDIO_TYPES,
-        requestHeaders: {
-          ...buildDefaultAudioFetchHeaders(audioUrls[i]),
-          ...audioHeaders
-        },
-        timeoutMs: DOWNLOAD_TIMEOUT_MS,
-        maxBytes: MAX_DOWNLOAD_BYTES,
-        fileLabel: `audio${audioUrls.length > 1 ? ` #${i + 1}` : ''}`
+    let downloadedAudio: DownloadAudioPartsResult;
+    try {
+      downloadedAudio = await downloadAudioParts({
+        audioUrls: effectiveAudioUrls,
+        workDir,
+        audioHeaders
       });
-      audioPartPaths.push(audioPartPath);
-      totalAudioBytes += audioDownload.bytes;
+    } catch (error: unknown) {
+      const fallbackAudioUrls = buildGoogleTtsChunkUrls(script);
+      if (!isAuthDownloadError(error) || fallbackAudioUrls.length === 0) {
+        throw error;
+      }
+
+      console.warn(
+        `[render] audio auth failed for request_id=${idempotencyKey}, retrying with google tts fallback`
+      );
+
+      effectiveAudioUrls = fallbackAudioUrls;
+      audioSource = 'google_fallback';
+      downloadedAudio = await downloadAudioParts({
+        audioUrls: effectiveAudioUrls,
+        workDir,
+        audioHeaders: {}
+      });
     }
+
+    const { partPaths: audioPartPaths, totalBytes: totalAudioBytes } = downloadedAudio;
 
     if (audioPartPaths.length === 1) {
       await fs.rename(audioPartPaths[0], audioPath);
@@ -262,8 +286,10 @@ app.post('/render', async (req: Request<unknown, unknown, RenderRequestBody>, re
 
     console.log(
       `[render] start request_id=${idempotencyKey} images=${imagePaths.length} audio_chunks=${
-        audioUrls.length
-      } audio_url=${sanitizeUrlForLog(audioUrls[0])} audio_bytes=${totalAudioBytes} est_duration=${estimatedDurationSec.toFixed(
+        effectiveAudioUrls.length
+      } audio_source=${audioSource} audio_url=${sanitizeUrlForLog(
+        effectiveAudioUrls[0]
+      )} audio_bytes=${totalAudioBytes} est_duration=${estimatedDurationSec.toFixed(
         2
       )}s`
     );
@@ -520,6 +546,94 @@ function parseOptionalHeaderRecord(value: unknown, fieldName: string): Record<st
   return parsedHeaders;
 }
 
+function normalizeWhitespace(value: string): string {
+  return String(value || '').replace(/\s+/g, ' ').trim();
+}
+
+function splitTextForGoogleTts(text: string, maxChars: number): string[] {
+  const cleaned = normalizeWhitespace(text);
+  if (!cleaned) {
+    return [];
+  }
+
+  const chunks: string[] = [];
+  const sentences = cleaned.match(/[^.!?]+[.!?]*/g) || [cleaned];
+  let current = '';
+
+  const pushCurrent = () => {
+    const normalized = normalizeWhitespace(current);
+    if (normalized) {
+      chunks.push(normalized);
+    }
+    current = '';
+  };
+
+  for (const rawSentence of sentences) {
+    const sentence = normalizeWhitespace(rawSentence);
+    if (!sentence) {
+      continue;
+    }
+
+    if (sentence.length > maxChars) {
+      pushCurrent();
+
+      const words = sentence.split(' ');
+      let buffer = '';
+
+      for (const rawWord of words) {
+        const word = normalizeWhitespace(rawWord);
+        if (!word) {
+          continue;
+        }
+
+        const candidate = buffer ? `${buffer} ${word}` : word;
+        if (candidate.length <= maxChars) {
+          buffer = candidate;
+          continue;
+        }
+
+        if (buffer) {
+          chunks.push(buffer);
+        }
+
+        if (word.length > maxChars) {
+          for (let i = 0; i < word.length; i += maxChars) {
+            chunks.push(word.slice(i, i + maxChars));
+          }
+          buffer = '';
+        } else {
+          buffer = word;
+        }
+      }
+
+      if (buffer) {
+        chunks.push(buffer);
+      }
+      continue;
+    }
+
+    const merged = current ? `${current} ${sentence}` : sentence;
+    if (merged.length <= maxChars) {
+      current = merged;
+    } else {
+      pushCurrent();
+      current = sentence;
+    }
+  }
+
+  pushCurrent();
+  return chunks.slice(0, MAX_AUDIO_URLS);
+}
+
+function buildGoogleTtsChunkUrls(script: string): string[] {
+  const chunks = splitTextForGoogleTts(script, GOOGLE_TTS_MAX_CHARS);
+  return chunks.map((chunk) => `${GOOGLE_TTS_BASE_URL}${encodeURIComponent(chunk)}`);
+}
+
+function isAuthDownloadError(error: unknown): boolean {
+  return error instanceof HttpError && /HTTP (401|403)\b/.test(error.message);
+}
+
 function resolveIdempotencyKey(req: Request<unknown, unknown, RenderRequestBody>): string {
   const headerValue = req.header('Idempotency-Key');
   if (headerValue && headerValue.trim()) {
@@ -589,6 +703,36 @@ function buildDefaultAudioFetchHeaders(audioUrl: string): Record<string, string>
     Accept: 'audio/mpeg,audio/*;q=0.9,*/*;q=0.8',
     'Accept-Language': 'pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7',
     Referer: referer
+  };
+}
+
+async function downloadAudioParts(options: DownloadAudioPartsOptions): Promise<DownloadAudioPartsResult> {
+  const { audioUrls, workDir, audioHeaders } = options;
+  const partPaths: string[] = [];
+  let totalBytes = 0;
+
+  for (let i = 0; i < audioUrls.length; i += 1) {
+    const audioPartPath = path.join(workDir, `audio_part_${String(i).padStart(3, '0')}.mp3`);
+    const audioDownload = await downloadToFile({
+      url: audioUrls[i],
+      destinationPath: audioPartPath,
+      allowedContentTypes: ALLOWED_AUDIO_TYPES,
+      requestHeaders: {
+        ...buildDefaultAudioFetchHeaders(audioUrls[i]),
+        ...audioHeaders
+      },
+      timeoutMs: DOWNLOAD_TIMEOUT_MS,
+      maxBytes: MAX_DOWNLOAD_BYTES,
+      fileLabel: `audio${audioUrls.length > 1 ? ` #${i + 1}` : ''}`
+    });
+
+    partPaths.push(audioPartPath);
+    totalBytes += audioDownload.bytes;
+  }
+
+  return {
+    partPaths,
+    totalBytes
   };
 }
 
