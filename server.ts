@@ -12,6 +12,7 @@ import type { NextFunction, Request, Response } from 'express';
 
 type RenderRequestBody = {
   audio_url?: unknown;
+  audio_urls?: unknown;
   audio_headers?: unknown;
   image_urls?: unknown;
   script?: unknown;
@@ -90,6 +91,7 @@ const MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024;
 const DOWNLOAD_TIMEOUT_MS = parsePositiveInteger(process.env.DOWNLOAD_TIMEOUT_MS, 30_000);
 const DEFAULT_SECONDS_PER_IMAGE = 3;
 const MAX_SECONDS_PER_IMAGE = 20;
+const MAX_AUDIO_URLS = 30;
 const MAX_AUDIO_DURATION_SEC = parsePositiveInteger(process.env.MAX_AUDIO_DURATION_SEC, 60);
 const TARGET_WIDTH = 1080;
 const TARGET_HEIGHT = 1920;
@@ -176,6 +178,7 @@ app.post('/render', async (req: Request<unknown, unknown, RenderRequestBody>, re
   try {
     const {
       audio_url: audioUrlRaw,
+      audio_urls: audioUrlsRaw,
       audio_headers: audioHeadersRaw,
       image_urls: imageUrlsRaw,
       script: scriptRaw,
@@ -184,13 +187,16 @@ app.post('/render', async (req: Request<unknown, unknown, RenderRequestBody>, re
     } = req.body || {};
     void titleRaw;
 
-    const audioUrl = requireNonEmptyString(audioUrlRaw, 'audio_url');
+    const audioUrls = parseAudioUrlList(audioUrlRaw, audioUrlsRaw);
     const audioHeaders = parseOptionalHeaderRecord(audioHeadersRaw, 'audio_headers');
     const imageUrls = requireImageUrlArray(imageUrlsRaw);
     const secondsPerImage = parseSecondsPerImage(secondsPerImageRaw);
     const script = typeof scriptRaw === 'string' ? scriptRaw.trim() : '';
 
-    validateUrl(audioUrl, 'audio_url');
+    for (let i = 0; i < audioUrls.length; i += 1) {
+      validateUrl(audioUrls[i], `audio_urls[${i}]`);
+    }
+
     for (let i = 0; i < imageUrls.length; i += 1) {
       validateUrl(imageUrls[i], `image_urls[${i}]`);
     }
@@ -199,18 +205,32 @@ app.post('/render', async (req: Request<unknown, unknown, RenderRequestBody>, re
     await ensureOutputRoot();
 
     const audioPath = path.join(workDir, 'audio.mp3');
-    const audioDownload = await downloadToFile({
-      url: audioUrl,
-      destinationPath: audioPath,
-      allowedContentTypes: ALLOWED_AUDIO_TYPES,
-      requestHeaders: {
-        ...buildDefaultAudioFetchHeaders(audioUrl),
-        ...audioHeaders
-      },
-      timeoutMs: DOWNLOAD_TIMEOUT_MS,
-      maxBytes: MAX_DOWNLOAD_BYTES,
-      fileLabel: 'audio'
-    });
+    const audioPartPaths: string[] = [];
+    let totalAudioBytes = 0;
+
+    for (let i = 0; i < audioUrls.length; i += 1) {
+      const audioPartPath = path.join(workDir, `audio_part_${String(i).padStart(3, '0')}.mp3`);
+      const audioDownload = await downloadToFile({
+        url: audioUrls[i],
+        destinationPath: audioPartPath,
+        allowedContentTypes: ALLOWED_AUDIO_TYPES,
+        requestHeaders: {
+          ...buildDefaultAudioFetchHeaders(audioUrls[i]),
+          ...audioHeaders
+        },
+        timeoutMs: DOWNLOAD_TIMEOUT_MS,
+        maxBytes: MAX_DOWNLOAD_BYTES,
+        fileLabel: `audio${audioUrls.length > 1 ? ` #${i + 1}` : ''}`
+      });
+      audioPartPaths.push(audioPartPath);
+      totalAudioBytes += audioDownload.bytes;
+    }
+
+    if (audioPartPaths.length === 1) {
+      await fs.rename(audioPartPaths[0], audioPath);
+    } else {
+      await concatAudioParts(audioPartPaths, audioPath);
+    }
 
     const imagePaths: string[] = [];
     for (let i = 0; i < imageUrls.length; i += 1) {
@@ -241,9 +261,11 @@ app.post('/render', async (req: Request<unknown, unknown, RenderRequestBody>, re
     const estimatedDurationSec = Math.max(audioDurationSec, imagePaths.length * secondsPerImage);
 
     console.log(
-      `[render] start request_id=${idempotencyKey} images=${imagePaths.length} audio_url=${sanitizeUrlForLog(
-        audioUrl
-      )} audio_bytes=${audioDownload.bytes} est_duration=${estimatedDurationSec.toFixed(2)}s`
+      `[render] start request_id=${idempotencyKey} images=${imagePaths.length} audio_chunks=${
+        audioUrls.length
+      } audio_url=${sanitizeUrlForLog(audioUrls[0])} audio_bytes=${totalAudioBytes} est_duration=${estimatedDurationSec.toFixed(
+        2
+      )}s`
     );
 
     const concatPath = path.join(workDir, 'slides.txt');
@@ -413,6 +435,44 @@ function requireImageUrlArray(value: unknown): string[] {
     }
     return item.trim();
   });
+}
+
+function parseAudioUrlList(audioUrlValue: unknown, audioUrlsValue: unknown): string[] {
+  const urls: string[] = [];
+
+  const pushUrl = (raw: unknown, fieldName: string) => {
+    if (typeof raw !== 'string' || raw.trim() === '') {
+      throw new HttpError(400, `Campo "${fieldName}" deve ser uma URL valida.`);
+    }
+    const cleaned = raw.trim();
+    if (!urls.includes(cleaned)) {
+      urls.push(cleaned);
+    }
+  };
+
+  if (Array.isArray(audioUrlsValue)) {
+    if (audioUrlsValue.length === 0) {
+      throw new HttpError(400, 'Campo "audio_urls" nao pode ser vazio.');
+    }
+    if (audioUrlsValue.length > MAX_AUDIO_URLS) {
+      throw new HttpError(400, `Campo "audio_urls" aceita no maximo ${MAX_AUDIO_URLS} URLs.`);
+    }
+    for (let i = 0; i < audioUrlsValue.length; i += 1) {
+      pushUrl(audioUrlsValue[i], `audio_urls[${i}]`);
+    }
+  } else if (audioUrlsValue !== undefined && audioUrlsValue !== null) {
+    throw new HttpError(400, 'Campo "audio_urls" deve ser um array de URLs.');
+  }
+
+  if (audioUrlValue !== undefined && audioUrlValue !== null && String(audioUrlValue).trim() !== '') {
+    pushUrl(audioUrlValue, 'audio_url');
+  }
+
+  if (!urls.length) {
+    throw new HttpError(400, 'Campo "audio_url" ou "audio_urls" e obrigatorio.');
+  }
+
+  return urls;
 }
 
 function parseSecondsPerImage(value: unknown): number {
@@ -703,6 +763,47 @@ async function createConcatFile(options: CreateConcatFileOptions): Promise<void>
   }
 
   await fs.writeFile(concatPath, `${lines.join('\n')}\n`, 'utf8');
+}
+
+async function concatAudioParts(audioPartPaths: string[], outputPath: string): Promise<void> {
+  if (audioPartPaths.length < 2) {
+    throw new HttpError(500, 'Concatenacao de audio requer pelo menos 2 partes.');
+  }
+
+  const concatPath = path.join(path.dirname(outputPath), 'audio_concat.txt');
+  const lines = audioPartPaths.map((filePath) => `file '${escapeConcatPath(filePath)}'`);
+  await fs.writeFile(concatPath, `${lines.join('\n')}\n`, 'utf8');
+
+  try {
+    await runProcess(
+      FFMPEG_BIN,
+      ['-y', '-f', 'concat', '-safe', '0', '-i', concatPath, '-c', 'copy', outputPath],
+      { timeoutMs: 60_000 }
+    );
+    return;
+  } catch (copyError: unknown) {
+    console.warn('[render] audio concat copy failed, re-encoding', copyError);
+  }
+
+  await runProcess(
+    FFMPEG_BIN,
+    [
+      '-y',
+      '-f',
+      'concat',
+      '-safe',
+      '0',
+      '-i',
+      concatPath,
+      '-vn',
+      '-c:a',
+      'libmp3lame',
+      '-b:a',
+      '128k',
+      outputPath
+    ],
+    { timeoutMs: 90_000 }
+  );
 }
 
 async function runFfmpegWithOptionalText(options: RenderFfmpegOptions): Promise<void> {
