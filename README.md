@@ -39,6 +39,10 @@ Serviço HTTP em Bun + Express (TypeScript) que recebe URLs de áudio/imagens, g
 ```json
 {
   "audio_url": "https://exemplo.com/audio.mp3",
+  "audio_headers": {
+    "Authorization": "Bearer ...",
+    "User-Agent": "Mozilla/5.0 ..."
+  },
   "image_urls": [
     "https://exemplo.com/img1.jpg",
     "https://exemplo.com/img2.png"
@@ -51,6 +55,7 @@ Serviço HTTP em Bun + Express (TypeScript) que recebe URLs de áudio/imagens, g
 
 Validações:
 - `audio_url` obrigatório
+- `audio_headers` opcional (headers para baixar o áudio em URLs protegidas)
 - `image_urls` obrigatório (`1..10`)
 - `seconds_per_image` opcional (default `3`, aceito `> 0` e `<= 20`)
 - duração máxima de áudio (default `60s`)

@@ -11,6 +11,7 @@ import type { NextFunction, Request, Response } from 'express';
 
 type RenderRequestBody = {
   audio_url?: unknown;
+  audio_headers?: unknown;
   image_urls?: unknown;
   script?: unknown;
   title?: unknown;
@@ -21,6 +22,7 @@ type DownloadToFileOptions = {
   url: string;
   destinationPath: string;
   allowedContentTypes: Set<string>;
+  requestHeaders?: Record<string, string>;
   timeoutMs: number;
   maxBytes: number;
   fileLabel: string;
@@ -107,6 +109,7 @@ app.post('/render', async (req: Request<unknown, unknown, RenderRequestBody>, re
   try {
     const {
       audio_url: audioUrlRaw,
+      audio_headers: audioHeadersRaw,
       image_urls: imageUrlsRaw,
       script: scriptRaw,
       title: titleRaw,
@@ -115,6 +118,7 @@ app.post('/render', async (req: Request<unknown, unknown, RenderRequestBody>, re
     void titleRaw;
 
     const audioUrl = requireNonEmptyString(audioUrlRaw, 'audio_url');
+    const audioHeaders = parseOptionalHeaderRecord(audioHeadersRaw, 'audio_headers');
     const imageUrls = requireImageUrlArray(imageUrlsRaw);
     const secondsPerImage = parseSecondsPerImage(secondsPerImageRaw);
     const script = typeof scriptRaw === 'string' ? scriptRaw.trim() : '';
@@ -131,6 +135,10 @@ app.post('/render', async (req: Request<unknown, unknown, RenderRequestBody>, re
       url: audioUrl,
       destinationPath: audioPath,
       allowedContentTypes: ALLOWED_AUDIO_TYPES,
+      requestHeaders: {
+        ...buildDefaultAudioFetchHeaders(audioUrl),
+        ...audioHeaders
+      },
       timeoutMs: DOWNLOAD_TIMEOUT_MS,
       maxBytes: MAX_DOWNLOAD_BYTES,
       fileLabel: 'audio'
@@ -314,6 +322,48 @@ function parseSecondsPerImage(value: unknown): number {
   return numeric;
 }
 
+function parseOptionalHeaderRecord(value: unknown, fieldName: string): Record<string, string> {
+  if (value === undefined || value === null) {
+    return {};
+  }
+  if (typeof value !== 'object' || Array.isArray(value)) {
+    throw new HttpError(400, `Campo "${fieldName}" deve ser um objeto de headers.`);
+  }
+
+  const parsedHeaders: Record<string, string> = {};
+  for (const [rawKey, rawValue] of Object.entries(value as Record<string, unknown>)) {
+    const key = String(rawKey).trim();
+    const val = typeof rawValue === 'string' ? rawValue.trim() : '';
+    if (!key || !val) {
+      continue;
+    }
+    if (/\r|\n/.test(key) || /\r|\n/.test(val)) {
+      throw new HttpError(400, `Campo "${fieldName}" contem header invalido.`);
+    }
+    parsedHeaders[key] = val;
+  }
+
+  return parsedHeaders;
+}
+
+function buildDefaultAudioFetchHeaders(audioUrl: string): Record<string, string> {
+  let referer = 'https://api.streamelements.com/';
+  try {
+    const parsed = new URL(audioUrl);
+    referer = `${parsed.protocol}//${parsed.host}/`;
+  } catch {
+    // no-op: fallback referer
+  }
+
+  return {
+    'User-Agent':
+      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    Accept: 'audio/mpeg,audio/*;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7',
+    Referer: referer
+  };
+}
+
 function validateUrl(urlValue: string, fieldName: string): void {
   try {
     const parsed = new URL(urlValue);
@@ -326,7 +376,8 @@ function validateUrl(urlValue: string, fieldName: string): void {
 }
 
 async function downloadToFile(options: DownloadToFileOptions): Promise<DownloadResult> {
-  const { url, destinationPath, allowedContentTypes, timeoutMs, maxBytes, fileLabel } = options;
+  const { url, destinationPath, allowedContentTypes, requestHeaders, timeoutMs, maxBytes, fileLabel } =
+    options;
 
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
@@ -336,6 +387,7 @@ async function downloadToFile(options: DownloadToFileOptions): Promise<DownloadR
     response = await fetch(url, {
       method: 'GET',
       redirect: 'follow',
+      headers: requestHeaders,
       signal: controller.signal
     });
   } catch (error: unknown) {
@@ -348,7 +400,11 @@ async function downloadToFile(options: DownloadToFileOptions): Promise<DownloadR
 
   if (!response.ok) {
     clearTimeout(timeout);
-    throw new HttpError(502, `Falha ao baixar ${fileLabel}: HTTP ${response.status}.`);
+    const authHint =
+      response.status === 401 || response.status === 403
+        ? ' Verifique autenticacao/headers da URL de origem.'
+        : '';
+    throw new HttpError(502, `Falha ao baixar ${fileLabel}: HTTP ${response.status}.${authHint}`);
   }
 
   const contentTypeHeader = String(response.headers.get('content-type') || '')
