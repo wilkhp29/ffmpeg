@@ -2,10 +2,11 @@ const express = require('express') as typeof import('express');
 const os = require('node:os');
 const path = require('node:path');
 const fs = require('node:fs/promises') as typeof import('node:fs/promises');
-const { createWriteStream, createReadStream } = require('node:fs') as typeof import('node:fs');
+const { createWriteStream } = require('node:fs') as typeof import('node:fs');
 const { spawn } = require('node:child_process') as typeof import('node:child_process');
 const { pipeline } = require('node:stream/promises') as typeof import('node:stream/promises');
-const { Transform, Readable } = require('node:stream') as typeof import('node:stream');
+const { Readable, Transform } = require('node:stream') as typeof import('node:stream');
+const crypto = require('node:crypto') as typeof import('node:crypto');
 
 import type { NextFunction, Request, Response } from 'express';
 
@@ -16,6 +17,7 @@ type RenderRequestBody = {
   script?: unknown;
   title?: unknown;
   seconds_per_image?: unknown;
+  request_id?: unknown;
 };
 
 type DownloadToFileOptions = {
@@ -64,12 +66,28 @@ type ProcessError = Error & {
   timedOut?: boolean;
 };
 
+type ProcessingJob = {
+  status: 'processing';
+  createdAt: number;
+  startedAt: number;
+};
+
+type CompletedJob = {
+  status: 'completed';
+  createdAt: number;
+  startedAt: number;
+  finishedAt: number;
+  output: string;
+};
+
+type JobRecord = ProcessingJob | CompletedJob;
+
 const app = express();
 
-const PORT = Number.parseInt(process.env.PORT || '3000', 10);
+const PORT = parsePositiveInteger(process.env.PORT, 3000);
 const MAX_IMAGES = 10;
 const MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024;
-const DOWNLOAD_TIMEOUT_MS = 30_000;
+const DOWNLOAD_TIMEOUT_MS = parsePositiveInteger(process.env.DOWNLOAD_TIMEOUT_MS, 30_000);
 const DEFAULT_SECONDS_PER_IMAGE = 3;
 const MAX_SECONDS_PER_IMAGE = 20;
 const MAX_AUDIO_DURATION_SEC = parsePositiveInteger(process.env.MAX_AUDIO_DURATION_SEC, 60);
@@ -82,29 +100,78 @@ const FFMPEG_STDERR_PREVIEW_CHARS = 4000;
 const DRAWTEXT_FONT = '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf';
 const FFMPEG_BIN = process.env.FFMPEG_PATH || 'ffmpeg';
 const FFPROBE_BIN = process.env.FFPROBE_PATH || 'ffprobe';
+const MAX_CONCURRENT_JOBS = parsePositiveInteger(process.env.MAX_CONCURRENT_JOBS, 1);
+const RETRY_AFTER_SEC = parsePositiveInteger(process.env.RETRY_AFTER_SEC, 5);
+const JOB_CACHE_TTL_MS = parsePositiveInteger(process.env.JOB_CACHE_TTL_MS, 60 * 60 * 1000);
+const OUTPUT_TTL_MS = parsePositiveInteger(process.env.OUTPUT_TTL_MS, 6 * 60 * 60 * 1000);
+const OUTPUT_CLEANUP_INTERVAL_MS = parsePositiveInteger(
+  process.env.OUTPUT_CLEANUP_INTERVAL_MS,
+  10 * 60 * 1000
+);
+const OUTPUT_ROOT = process.env.OUTPUT_ROOT || path.join(os.tmpdir(), 'ffmpeg-worker-outputs');
+const OUTPUT_BASE_URL = String(process.env.OUTPUT_BASE_URL || '').trim().replace(/\/+$/, '');
 
 const ALLOWED_AUDIO_TYPES = new Set(['audio/mpeg', 'application/octet-stream']);
 const ALLOWED_IMAGE_TYPES = new Set(['image/jpeg', 'image/png']);
 
-let isRendering = false;
+const jobCache = new Map<string, JobRecord>();
+let activeJobs = 0;
+let outputRootReady: Promise<void> | undefined;
 
+app.disable('x-powered-by');
 app.use(express.json({ limit: '256kb' }));
 
 app.get('/health', (_req: Request, res: Response) => {
-  res.status(200).type('text/plain').send('ok');
+  res.status(200).json({ status: 'ok' });
 });
 
 app.get('/', (_req: Request, res: Response) => {
-  res.status(200).type('text/plain').send('ok');
+  res.status(200).json({ status: 'ok' });
 });
 
 app.post('/render', async (req: Request<unknown, unknown, RenderRequestBody>, res: Response) => {
-  if (isRendering) {
-    return res.status(429).json({ error: 'Worker ocupado. Tente novamente em instantes.' });
+  pruneJobCache();
+
+  const idempotencyKey = resolveIdempotencyKey(req);
+  const existingJob = jobCache.get(idempotencyKey);
+
+  if (existingJob?.status === 'completed') {
+    return res.status(200).json({
+      success: true,
+      output: existingJob.output,
+      request_id: idempotencyKey,
+      cached: true
+    });
   }
 
-  isRendering = true;
+  if (existingJob?.status === 'processing') {
+    return res.status(202).json({
+      success: false,
+      status: 'processing',
+      request_id: idempotencyKey,
+      retryable: true,
+      retry_after_sec: RETRY_AFTER_SEC
+    });
+  }
+
+  if (activeJobs >= MAX_CONCURRENT_JOBS) {
+    return res.status(429).json({
+      error: 'Worker ocupado. Tente novamente em instantes.',
+      retryable: true,
+      retry_after_sec: RETRY_AFTER_SEC
+    });
+  }
+
+  const startedAt = Date.now();
+  jobCache.set(idempotencyKey, {
+    status: 'processing',
+    createdAt: startedAt,
+    startedAt
+  });
+  activeJobs += 1;
+
   let workDir = '';
+  let keepCachedResult = false;
 
   try {
     const {
@@ -128,9 +195,10 @@ app.post('/render', async (req: Request<unknown, unknown, RenderRequestBody>, re
       validateUrl(imageUrls[i], `image_urls[${i}]`);
     }
 
-    workDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ffmpeg-worker-url-'));
-    const audioPath = path.join(workDir, 'audio.mp3');
+    workDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ffmpeg-worker-job-'));
+    await ensureOutputRoot();
 
+    const audioPath = path.join(workDir, 'audio.mp3');
     const audioDownload = await downloadToFile({
       url: audioUrl,
       destinationPath: audioPath,
@@ -146,21 +214,20 @@ app.post('/render', async (req: Request<unknown, unknown, RenderRequestBody>, re
 
     const imagePaths: string[] = [];
     for (let i = 0; i < imageUrls.length; i += 1) {
-      const url = imageUrls[i];
-      const tempPath = path.join(workDir, `img_${String(i).padStart(3, '0')}.tmp`);
+      const imageTempPath = path.join(workDir, `img_${String(i).padStart(3, '0')}.tmp`);
       const imageDownload = await downloadToFile({
-        url,
-        destinationPath: tempPath,
+        url: imageUrls[i],
+        destinationPath: imageTempPath,
         allowedContentTypes: ALLOWED_IMAGE_TYPES,
         timeoutMs: DOWNLOAD_TIMEOUT_MS,
         maxBytes: MAX_DOWNLOAD_BYTES,
         fileLabel: `image #${i + 1}`
       });
 
-      const ext = contentTypeToImageExtension(imageDownload.contentType);
-      const finalPath = path.join(workDir, `img_${String(i).padStart(3, '0')}${ext}`);
-      await fs.rename(tempPath, finalPath);
-      imagePaths.push(finalPath);
+      const imageExt = contentTypeToImageExtension(imageDownload.contentType);
+      const finalImagePath = path.join(workDir, `img_${String(i).padStart(3, '0')}${imageExt}`);
+      await fs.rename(imageTempPath, finalImagePath);
+      imagePaths.push(finalImagePath);
     }
 
     const audioDurationSec = await getMediaDuration(audioPath);
@@ -174,9 +241,9 @@ app.post('/render', async (req: Request<unknown, unknown, RenderRequestBody>, re
     const estimatedDurationSec = Math.max(audioDurationSec, imagePaths.length * secondsPerImage);
 
     console.log(
-      `[render] inicio images=${imagePaths.length} audio_url=${sanitizeUrlForLog(
+      `[render] start request_id=${idempotencyKey} images=${imagePaths.length} audio_url=${sanitizeUrlForLog(
         audioUrl
-      )} audio_bytes=${audioDownload.bytes} duracao_estimada=${estimatedDurationSec.toFixed(2)}s`
+      )} audio_bytes=${audioDownload.bytes} est_duration=${estimatedDurationSec.toFixed(2)}s`
     );
 
     const concatPath = path.join(workDir, 'slides.txt');
@@ -195,17 +262,32 @@ app.post('/render', async (req: Request<unknown, unknown, RenderRequestBody>, re
       script
     });
 
-    const outputStat = await fs.stat(outputPath);
-    console.log(`[render] sucesso output_bytes=${outputStat.size}`);
+    const stableOutputName = `${createStableOutputId(idempotencyKey)}.mp4`;
+    const persistedOutputPath = path.join(OUTPUT_ROOT, stableOutputName);
+    await fs.copyFile(outputPath, persistedOutputPath);
 
-    res.status(200).set({
-      'Content-Type': 'video/mp4',
-      'Content-Length': String(outputStat.size),
-      'Content-Disposition': 'inline; filename="output.mp4"'
+    const output = resolveOutputValue(persistedOutputPath);
+
+    jobCache.set(idempotencyKey, {
+      status: 'completed',
+      createdAt: startedAt,
+      startedAt,
+      finishedAt: Date.now(),
+      output
     });
 
-    await streamFileToResponse(outputPath, res);
-    return;
+    keepCachedResult = true;
+
+    console.log(`[render] success request_id=${idempotencyKey} output=${output}`);
+
+    void cleanupOldOutputs();
+
+    return res.status(200).json({
+      success: true,
+      output,
+      request_id: idempotencyKey,
+      cached: false
+    });
   } catch (error: unknown) {
     if (res.headersSent) {
       res.end();
@@ -213,12 +295,19 @@ app.post('/render', async (req: Request<unknown, unknown, RenderRequestBody>, re
     }
 
     if (error instanceof HttpError) {
-      return res.status(error.statusCode).json({ error: error.message });
+      return res.status(error.statusCode).json({
+        error: error.message,
+        request_id: idempotencyKey,
+        retryable: error.statusCode >= 500
+      });
     }
 
     if (isProcessTimeoutError(error)) {
       return res.status(504).json({
-        error: `Timeout no FFmpeg apos ${FFMPEG_TIMEOUT_MS}ms. Tente audio menor ou menos imagens.`
+        error: `Timeout no FFmpeg apos ${FFMPEG_TIMEOUT_MS}ms.`,
+        request_id: idempotencyKey,
+        retryable: true,
+        retry_after_sec: RETRY_AFTER_SEC
       });
     }
 
@@ -231,19 +320,31 @@ app.post('/render', async (req: Request<unknown, unknown, RenderRequestBody>, re
       FFMPEG_STDERR_PREVIEW_CHARS
     );
 
-    console.error('[render] erro', error);
+    console.error('[render] error', error);
+
     return res.status(500).json({
       error: 'Falha no FFmpeg durante a renderizacao.',
+      request_id: idempotencyKey,
+      retryable: true,
       ...(stderrPreview ? { stderr_preview: stderrPreview } : {})
     });
   } finally {
+    if (!keepCachedResult) {
+      jobCache.delete(idempotencyKey);
+    }
+
+    activeJobs = Math.max(0, activeJobs - 1);
+
     if (workDir) {
       await fs.rm(workDir, { recursive: true, force: true }).catch((cleanupError: unknown) => {
-        console.error('[render] erro ao limpar temporarios', cleanupError);
+        console.error('[render] cleanup error', cleanupError);
       });
     }
-    isRendering = false;
   }
+});
+
+app.use((_req: Request, res: Response) => {
+  res.status(404).json({ error: 'Rota nao encontrada.' });
 });
 
 app.use((error: unknown, _req: Request, res: Response, _next: NextFunction) => {
@@ -255,13 +356,22 @@ app.use((error: unknown, _req: Request, res: Response, _next: NextFunction) => {
     return res.status(400).json({ error: 'JSON invalido no corpo da requisicao.' });
   }
 
-  console.error('[http] erro inesperado', error);
+  console.error('[http] unexpected error', error);
   return res.status(500).json({ error: 'Erro interno inesperado.' });
 });
 
 app.listen(PORT, () => {
-  console.log(`FFmpeg Worker URL mode rodando na porta ${PORT}`);
+  console.log(`FFmpeg Worker running on port ${PORT}`);
 });
+
+void ensureOutputRoot().catch((error: unknown) => {
+  console.error('[startup] failed to prepare output directory', error);
+});
+
+const cleanupInterval = setInterval(() => {
+  void cleanupOldOutputs();
+}, OUTPUT_CLEANUP_INTERVAL_MS);
+cleanupInterval.unref();
 
 class HttpError extends Error {
   public readonly statusCode: number;
@@ -292,18 +402,17 @@ function requireImageUrlArray(value: unknown): string[] {
   if (!Array.isArray(value) || value.length === 0) {
     throw new HttpError(400, 'Campo "image_urls" e obrigatorio (1 a 10 URLs).');
   }
+
   if (value.length > MAX_IMAGES) {
     throw new HttpError(400, `Campo "image_urls" aceita no maximo ${MAX_IMAGES} URLs.`);
   }
 
-  const cleaned = value.map((item: unknown, index: number) => {
+  return value.map((item: unknown, index: number) => {
     if (typeof item !== 'string' || item.trim() === '') {
       throw new HttpError(400, `Campo "image_urls[${index}]" deve ser uma URL valida.`);
     }
     return item.trim();
   });
-
-  return cleaned;
 }
 
 function parseSecondsPerImage(value: unknown): number {
@@ -326,33 +435,92 @@ function parseOptionalHeaderRecord(value: unknown, fieldName: string): Record<st
   if (value === undefined || value === null) {
     return {};
   }
+
   if (typeof value !== 'object' || Array.isArray(value)) {
     throw new HttpError(400, `Campo "${fieldName}" deve ser um objeto de headers.`);
   }
 
   const parsedHeaders: Record<string, string> = {};
+
   for (const [rawKey, rawValue] of Object.entries(value as Record<string, unknown>)) {
     const key = String(rawKey).trim();
     const val = typeof rawValue === 'string' ? rawValue.trim() : '';
+
     if (!key || !val) {
       continue;
     }
+
     if (/\r|\n/.test(key) || /\r|\n/.test(val)) {
       throw new HttpError(400, `Campo "${fieldName}" contem header invalido.`);
     }
+
     parsedHeaders[key] = val;
   }
 
   return parsedHeaders;
 }
 
+function resolveIdempotencyKey(req: Request<unknown, unknown, RenderRequestBody>): string {
+  const headerValue = req.header('Idempotency-Key');
+  if (headerValue && headerValue.trim()) {
+    return normalizeIdempotencyValue(headerValue);
+  }
+
+  const requestIdValue = req.body?.request_id;
+  if (typeof requestIdValue === 'string' && requestIdValue.trim()) {
+    return normalizeIdempotencyValue(requestIdValue);
+  }
+
+  const bodyFingerprint = stableStringify(req.body || {});
+  return `auto_${crypto.createHash('sha256').update(bodyFingerprint).digest('hex').slice(0, 24)}`;
+}
+
+function normalizeIdempotencyValue(value: string): string {
+  const normalized = value.trim().replace(/[^a-zA-Z0-9._:-]/g, '_').slice(0, 128);
+  if (normalized) {
+    return normalized;
+  }
+  return crypto.createHash('sha256').update(value).digest('hex').slice(0, 24);
+}
+
+function stableStringify(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map((item: unknown) => stableStringify(item)).join(',')}]`;
+  }
+
+  if (value && typeof value === 'object') {
+    const entries = Object.entries(value as Record<string, unknown>).sort(([a], [b]) =>
+      a.localeCompare(b)
+    );
+    return `{${entries.map(([key, item]) => `${JSON.stringify(key)}:${stableStringify(item)}`).join(',')}}`;
+  }
+
+  return JSON.stringify(value);
+}
+
+function pruneJobCache(): void {
+  const now = Date.now();
+
+  for (const [key, record] of jobCache.entries()) {
+    if (record.status === 'completed' && now - record.finishedAt > JOB_CACHE_TTL_MS) {
+      jobCache.delete(key);
+      continue;
+    }
+
+    if (record.status === 'processing' && now - record.startedAt > FFMPEG_TIMEOUT_MS * 2) {
+      jobCache.delete(key);
+    }
+  }
+}
+
 function buildDefaultAudioFetchHeaders(audioUrl: string): Record<string, string> {
   let referer = 'https://api.streamelements.com/';
+
   try {
     const parsed = new URL(audioUrl);
     referer = `${parsed.protocol}//${parsed.host}/`;
   } catch {
-    // no-op: fallback referer
+    // fallback referer
   }
 
   return {
@@ -367,7 +535,7 @@ function buildDefaultAudioFetchHeaders(audioUrl: string): Record<string, string>
 function validateUrl(urlValue: string, fieldName: string): void {
   try {
     const parsed = new URL(urlValue);
-    if (!(parsed.protocol === 'http:' || parsed.protocol === 'https:')) {
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
       throw new Error('URL precisa de protocolo http/https.');
     }
   } catch {
@@ -392,18 +560,22 @@ async function downloadToFile(options: DownloadToFileOptions): Promise<DownloadR
     });
   } catch (error: unknown) {
     clearTimeout(timeout);
+
     if ((error as { name?: string } | null | undefined)?.name === 'AbortError') {
       throw new HttpError(502, `Timeout ao baixar ${fileLabel} (${timeoutMs}ms).`);
     }
+
     throw new HttpError(502, `Falha de rede ao baixar ${fileLabel}.`);
   }
 
   if (!response.ok) {
     clearTimeout(timeout);
+
     const authHint =
       response.status === 401 || response.status === 403
         ? ' Verifique autenticacao/headers da URL de origem.'
         : '';
+
     throw new HttpError(502, `Falha ao baixar ${fileLabel}: HTTP ${response.status}.${authHint}`);
   }
 
@@ -436,7 +608,11 @@ async function downloadToFile(options: DownloadToFileOptions): Promise<DownloadR
 
   let totalBytes = 0;
   const limiter = new Transform({
-    transform(chunk: Buffer, _encoding: BufferEncoding, callback: (error?: Error | null, data?: Buffer) => void) {
+    transform(
+      chunk: Buffer,
+      _encoding: BufferEncoding,
+      callback: (error?: Error | null, data?: Buffer) => void
+    ) {
       totalBytes += chunk.length;
       if (totalBytes > maxBytes) {
         callback(new HttpError(400, `${fileLabel} excede limite de 50MB.`));
@@ -450,21 +626,30 @@ async function downloadToFile(options: DownloadToFileOptions): Promise<DownloadR
     const bodyStream = Readable.fromWeb(
       response.body as unknown as import('node:stream/web').ReadableStream<Uint8Array>
     );
+
     await pipeline(bodyStream, limiter, createWriteStream(destinationPath));
+
     if (totalBytes === 0) {
       throw new HttpError(400, `${fileLabel} vazio.`);
     }
-    return { bytes: totalBytes, contentType: contentTypeHeader };
+
+    return {
+      bytes: totalBytes,
+      contentType: contentTypeHeader
+    };
   } catch (error: unknown) {
     if (error instanceof HttpError) {
       throw error;
     }
+
     if ((error as { name?: string } | null | undefined)?.name === 'AbortError') {
       throw new HttpError(502, `Timeout ao baixar ${fileLabel} (${timeoutMs}ms).`);
     }
+
     throw new HttpError(502, `Falha ao salvar ${fileLabel}.`);
   } finally {
     clearTimeout(timeout);
+
     if (totalBytes === 0) {
       await fs.rm(destinationPath, { force: true }).catch(() => {});
     }
@@ -485,11 +670,14 @@ async function getMediaDuration(filePath: string): Promise<number> {
     'default=noprint_wrappers=1:nokey=1',
     filePath
   ];
+
   const { stdout } = await runProcess(FFPROBE_BIN, args, { timeoutMs: 20_000 });
   const duration = Number.parseFloat(stdout.trim());
+
   if (!Number.isFinite(duration) || duration <= 0) {
     throw new HttpError(400, 'Nao foi possivel determinar duracao do audio.');
   }
+
   return duration;
 }
 
@@ -539,8 +727,9 @@ async function runFfmpegWithOptionalText(options: RenderFfmpegOptions): Promise<
     });
   } catch (error: unknown) {
     const stderr = String((error as { stderr?: string } | null | undefined)?.stderr || '');
+
     if (isDrawtextRelatedError(stderr)) {
-      console.warn('[render] drawtext indisponivel, renderizando sem texto');
+      console.warn('[render] drawtext unavailable, retrying without text');
       await runRenderFfmpeg({
         concatPath,
         audioPath,
@@ -549,6 +738,7 @@ async function runFfmpegWithOptionalText(options: RenderFfmpegOptions): Promise<
       });
       return;
     }
+
     throw error;
   }
 }
@@ -595,6 +785,7 @@ async function runRenderFfmpeg(options: RenderFfmpegOptions): Promise<void> {
 
 function buildVideoFilter(script: string): string {
   const base = `[0:v]fps=${TARGET_FPS},scale=${TARGET_WIDTH}:${TARGET_HEIGHT}:force_original_aspect_ratio=increase,crop=${TARGET_WIDTH}:${TARGET_HEIGHT},setsar=1`;
+
   if (!script) {
     return `${base},format=yuv420p[vout]`;
   }
@@ -645,40 +836,6 @@ function truncate(value: string, maxChars: number): string {
 
 function isProcessTimeoutError(error: unknown): error is ProcessError {
   return Boolean((error as ProcessError | null | undefined)?.timedOut);
-}
-
-async function streamFileToResponse(filePath: string, res: Response): Promise<void> {
-  await new Promise<void>((resolve, reject) => {
-    const fileStream = createReadStream(filePath);
-    let settled = false;
-
-    const finish = () => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      resolve();
-    };
-
-    const fail = (error: unknown) => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      reject(error);
-    };
-
-    fileStream.on('error', fail);
-    res.on('finish', finish);
-    res.on('close', () => {
-      if (!res.writableEnded) {
-        fileStream.destroy();
-        fail(new Error('Conexao encerrada durante envio do video.'));
-      }
-    });
-
-    fileStream.pipe(res);
-  });
 }
 
 function runProcess(
@@ -734,6 +891,7 @@ function runProcess(
           ? `${command} excedeu timeout de ${timeoutMs}ms`
           : `${command} finalizou com codigo ${code}`
       ) as ProcessError;
+
       error.code = code;
       error.signal = signal;
       error.stdout = stdout;
@@ -742,4 +900,42 @@ function runProcess(
       reject(error);
     });
   });
+}
+
+function createStableOutputId(idempotencyKey: string): string {
+  return crypto.createHash('sha256').update(idempotencyKey).digest('hex').slice(0, 24);
+}
+
+function resolveOutputValue(outputPath: string): string {
+  if (!OUTPUT_BASE_URL) {
+    return outputPath;
+  }
+  return `${OUTPUT_BASE_URL}/${path.basename(outputPath)}`;
+}
+
+function ensureOutputRoot(): Promise<void> {
+  if (!outputRootReady) {
+    outputRootReady = fs.mkdir(OUTPUT_ROOT, { recursive: true }).then(() => {});
+  }
+  return outputRootReady;
+}
+
+async function cleanupOldOutputs(): Promise<void> {
+  await ensureOutputRoot();
+
+  const now = Date.now();
+  const files = await fs.readdir(OUTPUT_ROOT).catch(() => [] as string[]);
+
+  for (const filename of files) {
+    const fullPath = path.join(OUTPUT_ROOT, filename);
+    const stat = await fs.stat(fullPath).catch(() => null);
+
+    if (!stat || !stat.isFile()) {
+      continue;
+    }
+
+    if (now - stat.mtimeMs > OUTPUT_TTL_MS) {
+      await fs.rm(fullPath, { force: true }).catch(() => {});
+    }
+  }
 }
