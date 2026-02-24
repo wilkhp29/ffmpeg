@@ -123,6 +123,7 @@ const OUTPUT_CLEANUP_INTERVAL_MS = parsePositiveInteger(
 );
 const OUTPUT_ROOT = process.env.OUTPUT_ROOT || path.join(os.tmpdir(), 'ffmpeg-worker-outputs');
 const OUTPUT_BASE_URL = String(process.env.OUTPUT_BASE_URL || '').trim().replace(/\/+$/, '');
+const OUTPUT_ROUTE_PREFIX = '/outputs';
 const GOOGLE_TTS_BASE_URL =
   'https://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob&tl=pt-BR&q=';
 const GOOGLE_TTS_MAX_CHARS = parsePositiveInteger(process.env.GOOGLE_TTS_MAX_CHARS, 180);
@@ -143,6 +144,44 @@ app.get('/health', (_req: Request, res: Response) => {
 
 app.get('/', (_req: Request, res: Response) => {
   res.status(200).json({ status: 'ok' });
+});
+
+app.get(`${OUTPUT_ROUTE_PREFIX}/:filename`, async (req: Request, res: Response) => {
+  const filename = String(req.params.filename || '').trim();
+  if (!/^[a-zA-Z0-9._-]+\.mp4$/i.test(filename)) {
+    return res.status(400).json({ error: 'Nome de arquivo invalido.' });
+  }
+
+  await ensureOutputRoot();
+
+  const outputRootResolved = path.resolve(OUTPUT_ROOT);
+  const filePath = path.resolve(OUTPUT_ROOT, filename);
+  if (!filePath.startsWith(`${outputRootResolved}${path.sep}`)) {
+    return res.status(400).json({ error: 'Caminho de arquivo invalido.' });
+  }
+
+  try {
+    const stat = await fs.stat(filePath);
+    if (!stat.isFile()) {
+      return res.status(404).json({ error: 'Arquivo nao encontrado.' });
+    }
+  } catch {
+    return res.status(404).json({ error: 'Arquivo nao encontrado.' });
+  }
+
+  res.setHeader('Cache-Control', 'public, max-age=86400');
+  return res.sendFile(filePath, (error: NodeJS.ErrnoException | null) => {
+    if (!error || res.headersSent) {
+      return;
+    }
+
+    if (error.code === 'ENOENT') {
+      res.status(404).json({ error: 'Arquivo nao encontrado.' });
+      return;
+    }
+
+    res.status(500).json({ error: 'Falha ao enviar arquivo.' });
+  });
 });
 
 app.post('/render', async (req: Request<unknown, unknown, RenderRequestBody>, res: Response) => {
@@ -1152,10 +1191,12 @@ function createStableOutputId(idempotencyKey: string): string {
 }
 
 function resolveOutputValue(outputPath: string): string {
+  const fileName = path.basename(outputPath);
+
   if (!OUTPUT_BASE_URL) {
-    return outputPath;
+    return `${OUTPUT_ROUTE_PREFIX}/${fileName}`;
   }
-  return `${OUTPUT_BASE_URL}/${path.basename(outputPath)}`;
+  return `${OUTPUT_BASE_URL}/${fileName}`;
 }
 
 function ensureOutputRoot(): Promise<void> {
