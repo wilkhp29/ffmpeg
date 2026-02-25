@@ -1062,9 +1062,10 @@ async function runRenderFfmpeg(options: RenderFfmpegOptions): Promise<void> {
     'aac',
     '-b:a',
     '128k',
+    '-af',
+    'apad',
     '-movflags',
     '+faststart',
-    '-shortest',
     outputPath
   ];
 
