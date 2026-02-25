@@ -210,8 +210,12 @@ app.post('/render', async (req: Request<unknown, unknown, RenderRequestBody>, re
   }
 
   if (activeJobs >= MAX_CONCURRENT_JOBS) {
-    return res.status(429).json({
-      error: 'Worker ocupado. Tente novamente em instantes.',
+    // Busy is transient on free instances, so report as processing
+    // to let clients retry without treating this as a hard failure.
+    return res.status(202).json({
+      success: false,
+      status: 'processing',
+      request_id: idempotencyKey,
       retryable: true,
       retry_after_sec: RETRY_AFTER_SEC
     });
