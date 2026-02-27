@@ -65,6 +65,13 @@ export type SaveStorageAction = {
   session: string;
 };
 
+export type EvaluateAction = {
+  action: 'evaluate';
+  script: string;
+  arg?: any;
+  key?: string;
+};
+
 export type PlaywrightAction =
   | GotoAction
   | ClickAction
@@ -76,7 +83,8 @@ export type PlaywrightAction =
   | ScreenshotAction
   | ExtractTextAction
   | ExtractAttrAction
-  | SaveStorageAction;
+  | SaveStorageAction
+  | EvaluateAction;
 
 export type PlaywrightRunRequest = {
   session?: string;
@@ -85,6 +93,12 @@ export type PlaywrightRunRequest = {
     server: string;
     username?: string;
     password?: string;
+  };
+  blockResources?: ('stylesheet' | 'image' | 'font')[];
+  userAgent?: string;
+  viewport?: {
+    width: number;
+    height: number;
   };
   actions: PlaywrightAction[];
 };

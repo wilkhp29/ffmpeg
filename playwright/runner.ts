@@ -74,6 +74,12 @@ type PageLike = {
   }) => Promise<unknown>;
   textContent: (selector: string, options: { timeout: number }) => Promise<string | null>;
   getAttribute: (selector: string, attr: string, options: { timeout: number }) => Promise<string | null>;
+  route: (
+    url: string | RegExp | ((url: URL) => boolean),
+    handler: (route: any) => void
+  ) => Promise<void>;
+  addInitScript: (script: string | Function | { path?: string; content?: string }) => Promise<void>;
+  evaluate: (script: string | Function, arg?: any) => Promise<any>;
 };
 
 export async function runPlaywrightJob(
@@ -133,12 +139,32 @@ export async function runPlaywrightJob(
 
     context = await browser.newContext({
       ...contextOptions,
-      viewport: { width: 1280, height: 800 },
-      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+      viewport: request.viewport || { width: 1280, height: 800 },
+      userAgent: request.userAgent || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
       bypassCSP: true,
       proxy: request.proxy
     });
     const page = await context.newPage();
+
+    // Kill Service Workers for performance on slow networks
+    await page.addInitScript(() => {
+      // @ts-ignore
+      if (window.navigator && window.navigator.serviceWorker) {
+        // @ts-ignore
+        delete window.navigator.serviceWorker;
+      }
+    });
+
+    if (request.blockResources && request.blockResources.length > 0) {
+      const blockedTypes = new Set(request.blockResources);
+      await page.route('**/*', (route) => {
+        const type = route.request().resourceType();
+        if (blockedTypes.has(type as any)) {
+          return route.abort();
+        }
+        return route.continue();
+      });
+    }
 
     page.setDefaultTimeout(Math.min(30_000, request.timeoutMs));
     page.on('console', (message: { type: () => string; text: () => string }) => {
@@ -370,6 +396,15 @@ async function executeAction(options: {
         file: path.basename(sessionPath)
       });
       appendLog(logs, `[step] saveStorage session=${action.session} file=${path.basename(sessionPath)}`);
+      return;
+    }
+
+    case 'evaluate': {
+      const result = await page.evaluate(action.script, action.arg);
+      if (action.key) {
+        outputs.extracted[action.key] = result;
+      }
+      appendLog(logs, `[step] evaluate script_len=${action.script.length} result=${JSON.stringify(result)}`);
       return;
     }
 

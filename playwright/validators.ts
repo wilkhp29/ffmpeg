@@ -14,7 +14,8 @@ const ACTION_NAMES = new Set([
   'screenshot',
   'extractText',
   'extractAttr',
-  'saveStorage'
+  'saveStorage',
+  'evaluate'
 ]);
 
 export function parseAllowDomains(rawValue: string | undefined): string[] {
@@ -91,6 +92,9 @@ export function parseRunRequestBody(
 
   const timeoutMs = parseTimeoutMs(payload.timeoutMs, options.defaultTimeoutMs);
   const proxy = parseOptionalProxy(payload.proxy);
+  const blockResources = parseOptionalBlockResources(payload.blockResources);
+  const userAgent = typeof payload.userAgent === 'string' ? payload.userAgent : undefined;
+  const viewport = parseOptionalViewport(payload.viewport);
   const actionsRaw = resolveActionsArray(payload);
 
   if (actionsRaw.length === 0) {
@@ -112,8 +116,28 @@ export function parseRunRequestBody(
     session,
     timeoutMs,
     proxy,
+    blockResources,
+    userAgent,
+    viewport,
     actions
   };
+}
+
+function parseOptionalBlockResources(value: unknown): PlaywrightRunRequest['blockResources'] {
+  if (!Array.isArray(value)) return undefined;
+  const allowed = new Set(['stylesheet', 'image', 'font']);
+  return value.filter((v) => allowed.has(v)) as any;
+}
+
+function parseOptionalViewport(value: unknown): PlaywrightRunRequest['viewport'] {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const obj = value as any;
+  const width = Number(obj.width);
+  const height = Number(obj.height);
+  if (Number.isFinite(width) && Number.isFinite(height)) {
+    return { width, height };
+  }
+  return undefined;
 }
 
 function parseOptionalProxy(value: unknown): PlaywrightRunRequest['proxy'] {
@@ -312,6 +336,20 @@ function parseAction(rawAction: unknown, index: number, allowDomains: string[]):
       return {
         action: 'saveStorage',
         session
+      };
+    }
+
+    case 'evaluate': {
+      assertOnlyAllowedKeys(normalized, ['action', 'script', 'arg', 'key'], actionPath);
+      const script = requireNonEmptyString(normalized.script, `${actionPath}.script`);
+      const arg = normalized.arg;
+      const key = typeof normalized.key === 'string' ? normalized.key : undefined;
+
+      return {
+        action: 'evaluate',
+        script,
+        arg,
+        key
       };
     }
 
