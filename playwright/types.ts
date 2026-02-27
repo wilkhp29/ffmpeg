@@ -81,6 +81,11 @@ export type PlaywrightAction =
 export type PlaywrightRunRequest = {
   session?: string;
   timeoutMs: number;
+  proxy?: {
+    server: string;
+    username?: string;
+    password?: string;
+  };
   actions: PlaywrightAction[];
 };
 

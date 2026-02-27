@@ -90,6 +90,7 @@ export function parseRunRequestBody(
   const session = parseOptionalSession(payload.session);
 
   const timeoutMs = parseTimeoutMs(payload.timeoutMs, options.defaultTimeoutMs);
+  const proxy = parseOptionalProxy(payload.proxy);
   const actionsRaw = resolveActionsArray(payload);
 
   if (actionsRaw.length === 0) {
@@ -110,8 +111,22 @@ export function parseRunRequestBody(
   return {
     session,
     timeoutMs,
+    proxy,
     actions
   };
+}
+
+function parseOptionalProxy(value: unknown): PlaywrightRunRequest['proxy'] {
+  if (value === undefined || value === null || value === '') {
+    return undefined;
+  }
+
+  const obj = requireObject(value, 'proxy');
+  const server = requireHttpUrl(obj.server, 'proxy.server');
+  const username = typeof obj.username === 'string' ? obj.username : undefined;
+  const password = typeof obj.password === 'string' ? obj.password : undefined;
+
+  return { server, username, password };
 }
 
 function resolveActionsArray(payload: Record<string, unknown>): unknown[] {

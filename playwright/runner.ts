@@ -20,7 +20,11 @@ import type { PlaywrightAction, PlaywrightJobOutputs, PlaywrightRunRequest, Play
 
 const { chromium } = require('playwright') as {
   chromium: {
-    launch: (options: { headless: boolean; args: string[] }) => Promise<BrowserLike>;
+    launch: (options: {
+      headless: boolean;
+      args: string[];
+      proxy?: { server: string; username?: string; password?: string };
+    }) => Promise<BrowserLike>;
   };
 };
 
@@ -30,6 +34,7 @@ type BrowserLike = {
     viewport?: { width: number; height: number };
     userAgent?: string;
     bypassCSP?: boolean;
+    proxy?: { server: string; username?: string; password?: string };
   }) => Promise<BrowserContextLike>;
   close: () => Promise<void>;
 };
@@ -110,7 +115,8 @@ export async function runPlaywrightJob(
         '--no-sandbox',
         '--disable-setuid-sandbox',
         '--disable-blink-features=AutomationControlled'
-      ]
+      ],
+      proxy: request.proxy
     });
 
     const contextOptions: { storageState?: string } = {};
@@ -129,7 +135,8 @@ export async function runPlaywrightJob(
       ...contextOptions,
       viewport: { width: 1280, height: 800 },
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-      bypassCSP: true
+      bypassCSP: true,
+      proxy: request.proxy
     });
     const page = await context.newPage();
 
