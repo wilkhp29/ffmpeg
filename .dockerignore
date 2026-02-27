@@ -6,4 +6,6 @@ npm-debug.log*
 coverage
 dist
 tmp
+storageStates
+outputs
 *.mp4

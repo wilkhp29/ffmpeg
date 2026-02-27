@@ -1,129 +1,293 @@
-# FFmpeg Worker (URL mode) para Render
+# FFmpeg Worker + Playwright Runner
 
-Serviço HTTP em Bun + Express (TypeScript) que recebe URLs de áudio/imagens, gera um vídeo vertical MP4 (1080x1920, 30fps) com FFmpeg e devolve o binário pronto para YouTube Shorts.
+Serviço HTTP único para:
+- render de vídeo com FFmpeg (`/render`)
+- automação web com Playwright (`/playwright/*`) para uso via n8n (HTTP Request)
 
-## Recursos
+## Stack
 
-- `GET /health` -> `200 ok`
-- `GET /` -> `200 ok`
-- `POST /render` -> retorna `video/mp4` binário
-- Entrada em JSON (`application/json`)
-- Download de arquivos por URL com:
-  - timeout de 30s por arquivo
-  - limite de 50MB por arquivo
-  - validação de `content-type`
-  - suporte a redirects
-- Slideshow via concat demuxer com repetição da última imagem quando o áudio é maior
-- Overlay de texto opcional (`drawtext`) com fallback automático sem texto se fonte/drawtext falhar
-- Mutex em memória: 1 job por vez (útil no plano free)
-- Limite de duração de áudio (default: `60s`) para reduzir risco de timeout/queda
-- Timeout de FFmpeg configurável (default: `180000ms`)
-- Resposta do vídeo em streaming (evita carregar o MP4 inteiro em memória)
+- `Express` + TypeScript
+- Runtime padrão no container: `Node + tsx`
+- `Playwright` (Chromium headless)
+- `FFmpeg` no mesmo container
 
-## Estrutura
+Observação: o projeto mantém suporte local com Bun via `npm run start:bun`, mas o deploy Docker foi ajustado para Node por robustez com Playwright.
 
-```text
-.
-├── .dockerignore
-├── .gitignore
-├── Dockerfile
-├── README.md
-├── package.json
-└── server.ts
+## Endpoints
+
+- `GET /health`
+- `GET /`
+- `POST /render`
+- `POST /playwright/run` (Bearer obrigatório)
+- `POST /playwright/save-state` (Bearer obrigatório)
+- `GET /playwright/artifacts/:jobId/:filename` (Bearer obrigatório)
+
+## Segurança Playwright
+
+Todos os endpoints ` /playwright/* ` exigem:
+- `Authorization: Bearer <PLAYWRIGHT_TOKEN>`
+
+Proteções implementadas:
+- allowlist de actions (sem `eval`/JS arbitrário)
+- limite máximo de actions por job (`MAX_ACTIONS`)
+- timeout total por job (`DEFAULT_TIMEOUT_MS`)
+- allowlist de domínios por `ALLOW_DOMAINS`
+- proteção contra path traversal em artefatos
+- `uploadFromUrl` com limite de 10MB e somente `image/*`
+
+## Variáveis de ambiente
+
+### Playwright
+
+- `PLAYWRIGHT_TOKEN` (obrigatório)
+- `ALLOW_DOMAINS="x.com,linkedin.com"` (opcional; vazio permite qualquer domínio)
+- `MAX_ACTIONS=50`
+- `DEFAULT_TIMEOUT_MS=60000`
+- `STORAGE_DIR=/app/storageStates`
+- `OUTPUT_DIR=/app/outputs`
+- `TMP_DIR=/app/tmp`
+
+### Servidor/FFmpeg
+
+- `PORT=10000`
+- `MAX_AUDIO_DURATION_SEC=60`
+- `FFMPEG_TIMEOUT_MS=180000`
+- `FFMPEG_PRESET=veryfast`
+- `FFMPEG_PATH=ffmpeg` (opcional)
+- `FFPROBE_PATH=ffprobe` (opcional)
+- `OUTPUT_ROOT` e `OUTPUT_BASE_URL` (fluxo FFmpeg existente)
+
+## Contrato `POST /playwright/run`
+
+Header:
+
+```bash
+Authorization: Bearer <PLAYWRIGHT_TOKEN>
+Content-Type: application/json
 ```
 
-## Contrato da API
-
-`POST /render` com JSON:
+Body:
 
 ```json
 {
-  "audio_url": "https://exemplo.com/audio.mp3",
-  "audio_headers": {
-    "Authorization": "Bearer ...",
-    "User-Agent": "Mozilla/5.0 ..."
-  },
-  "image_urls": [
-    "https://exemplo.com/img1.jpg",
-    "https://exemplo.com/img2.png"
-  ],
-  "script": "Texto opcional de overlay",
-  "title": "Opcional",
-  "seconds_per_image": 3
+  "session": "x-main",
+  "timeoutMs": 60000,
+  "actions": [
+    { "action": "goto", "url": "https://x.com/home", "waitUntil": "domcontentloaded" },
+    { "action": "click", "selector": "button[data-testid='SideNav_NewTweet_Button']" },
+    { "action": "fill", "selector": "div[role='textbox'][data-testid='tweetTextarea_0']", "text": "Olá do n8n" },
+    { "action": "screenshot", "name": "x-compose", "fullPage": false },
+    { "action": "extractText", "selector": "title", "key": "pageTitle" }
+  ]
 }
 ```
 
-Validações:
-- `audio_url` obrigatório
-- `audio_headers` opcional (headers para baixar o áudio em URLs protegidas)
-- `image_urls` obrigatório (`1..10`)
-- `seconds_per_image` opcional (default `3`, aceito `> 0` e `<= 20`)
-- duração máxima de áudio (default `60s`)
+Formato curto também é aceito:
 
-## Rodando local com Docker
-
-1. Build da imagem:
-
-```bash
-docker build -t ffmpeg-worker-url .
+```json
+{ "goto": { "url": "https://x.com" } }
 ```
 
-2. Subir container:
+Actions permitidas:
+- `goto { url, waitUntil? }`
+- `click { selector, delayMs? }`
+- `fill { selector, text }`
+- `press { selector, key }`
+- `waitFor { selector?, state?, timeoutMs? }`
+- `upload { selector, path }`
+- `uploadFromUrl { selector, url }`
+- `screenshot { name, fullPage? }`
+- `extractText { selector, key }`
+- `extractAttr { selector, attr, key }`
+- `saveStorage { session }`
 
-```bash
-docker run --rm -p 3000:3000 -e PORT=3000 ffmpeg-worker-url
+Resposta de sucesso:
+
+```json
+{
+  "ok": true,
+  "jobId": "f2ceecf4-5134-4a10-aef6-08ac403c7524",
+  "tookMs": 7342,
+  "outputs": {
+    "artifacts": [
+      {
+        "name": "x-compose",
+        "filename": "x-compose.png",
+        "url": "/playwright/artifacts/f2ceecf4-5134-4a10-aef6-08ac403c7524/x-compose.png"
+      }
+    ],
+    "extracted": {
+      "pageTitle": "Home / X"
+    },
+    "storage": []
+  },
+  "logs": ["..."]
+}
 ```
 
-3. Healthcheck:
+Resposta de erro:
 
-```bash
-curl http://localhost:3000/health
+```json
+{
+  "ok": false,
+  "error": "mensagem",
+  "details": {},
+  "logs": []
+}
 ```
 
-## Teste com curl (retorno MP4 binário)
+## `POST /playwright/save-state`
+
+Duas formas:
+
+1. Salvar `storageState` recebido no body:
+
+```json
+{
+  "session": "x-main",
+  "storageState": { "cookies": [], "origins": [] }
+}
+```
+
+2. Executar actions e salvar no final:
+
+```json
+{
+  "session": "x-main",
+  "actions": [
+    { "action": "goto", "url": "https://x.com/home" },
+    { "action": "waitFor", "selector": "[data-testid='SideNav_NewTweet_Button']", "timeoutMs": 15000 }
+  ]
+}
+```
+
+O endpoint adiciona automaticamente `saveStorage { session }` no final do job.
+
+## Sessões persistentes
+
+- Se a requisição vier com `"session": "x-main"` e existir `storageStates/x-main.json`, o runner carrega esse estado no `newContext`.
+- A action `saveStorage` persiste estado em `STORAGE_DIR/<session>.json`.
+
+## Artefatos
+
+- Screenshots ficam em `OUTPUT_DIR/<jobId>/`.
+- Download via `GET /playwright/artifacts/:jobId/:filename` com Bearer token.
+
+## Exemplo cURL (n8n-friendly)
+
+### 1) Publicar texto no X (demonstração)
 
 ```bash
-curl -X POST "http://localhost:3000/render" \
+curl -X POST "http://localhost:10000/playwright/run" \
+  -H "Authorization: Bearer $PLAYWRIGHT_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
-    "audio_url":"https://seu-host/audio.mp3",
-    "image_urls":[
-      "https://seu-host/img1.jpg",
-      "https://seu-host/img2.png"
-    ],
-    "script":"Meu texto opcional",
-    "seconds_per_image":3
-  }' \
-  --output output.mp4
+    "session": "x-main",
+    "actions": [
+      {"action":"goto","url":"https://x.com/home"},
+      {"action":"click","selector":"button[data-testid=\"SideNav_NewTweet_Button\"]"},
+      {"action":"fill","selector":"div[data-testid=\"tweetTextarea_0\"]","text":"Post automatizado via n8n"},
+      {"action":"click","selector":"button[data-testid=\"tweetButton\"]"},
+      {"action":"screenshot","name":"x-post-ok"}
+    ]
+  }'
 ```
 
-Depois valide o arquivo:
+### 2) Publicar texto + imagem (`uploadFromUrl`)
 
 ```bash
-ffprobe -v error -show_entries stream=codec_name,width,height,r_frame_rate -of compact=p=0:nk=1 output.mp4
+curl -X POST "http://localhost:10000/playwright/run" \
+  -H "Authorization: Bearer $PLAYWRIGHT_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "session": "x-main",
+    "actions": [
+      {"action":"goto","url":"https://x.com/home"},
+      {"action":"click","selector":"button[data-testid=\"SideNav_NewTweet_Button\"]"},
+      {"action":"fill","selector":"div[data-testid=\"tweetTextarea_0\"]","text":"Post com imagem via Playwright Runner"},
+      {"action":"uploadFromUrl","selector":"input[type=\"file\"]","url":"https://images.unsplash.com/photo-1469474968028-56623f02e42e"},
+      {"action":"click","selector":"button[data-testid=\"tweetButton\"]"},
+      {"action":"screenshot","name":"x-post-image-ok"}
+    ]
+  }'
 ```
 
-## Deploy no Render (Free)
+## n8n: payload pronto (HTTP Request)
 
-1. Suba este projeto para um repositório Git (GitHub/GitLab).
-2. No Render: **New** -> **Web Service**.
-3. Conecte o repositório.
-4. Em runtime, escolha **Docker**.
-5. Plano: **Free**.
-6. `Start Command`: deixe em branco (o `CMD ["bun","run","start"]` já está no Dockerfile).
-7. Configure o health check path para `/health`.
-8. Clique em **Create Web Service**.
+### Texto
 
-Render injeta `PORT` automaticamente. O servidor já usa `process.env.PORT`.
+```json
+{
+  "session": "x-main",
+  "actions": [
+    {"action":"goto","url":"https://x.com/home"},
+    {"action":"click","selector":"button[data-testid='SideNav_NewTweet_Button']"},
+    {"action":"fill","selector":"div[data-testid='tweetTextarea_0']","text":"{{$json.text}}"},
+    {"action":"click","selector":"button[data-testid='tweetButton']"},
+    {"action":"screenshot","name":"posted-text"}
+  ]
+}
+```
 
-Variáveis opcionais de runtime:
-- `MAX_AUDIO_DURATION_SEC` (default `60`)
-- `FFMPEG_TIMEOUT_MS` (default `180000`)
-- `FFMPEG_PRESET` (default `veryfast`)
-- `FFMPEG_PATH` e `FFPROBE_PATH` (opcional)
+### Texto + imagem (uploadFromUrl)
 
-## Observações importantes
+```json
+{
+  "session": "x-main",
+  "actions": [
+    {"action":"goto","url":"https://x.com/home"},
+    {"action":"click","selector":"button[data-testid='SideNav_NewTweet_Button']"},
+    {"action":"fill","selector":"div[data-testid='tweetTextarea_0']","text":"{{$json.text}}"},
+    {"action":"uploadFromUrl","selector":"input[type='file']","url":"{{$json.imageUrl}}"},
+    {"action":"click","selector":"button[data-testid='tweetButton']"},
+    {"action":"screenshot","name":"posted-image"}
+  ]
+}
+```
 
-- No plano free, existe **cold start** após inatividade.
-- Para reduzir latência inicial, você pode pingar `GET /health` periodicamente.
-- O endpoint retorna `video/mp4` diretamente no body da resposta (binário).
+No n8n, configure:
+- Método: `POST`
+- URL: `https://seu-servico/playwright/run`
+- Header: `Authorization: Bearer <PLAYWRIGHT_TOKEN>`
+- Content-Type: `application/json`
+
+## Gerar storageState manualmente (headful)
+
+Script:
+
+```bash
+npm run save-state -- --session x-main --url https://x.com/login
+```
+
+Fluxo:
+1. O Chromium abre em modo visual.
+2. Faça login manualmente.
+3. Volte ao terminal e pressione `ENTER`.
+4. O estado será salvo em `STORAGE_DIR/x-main.json`.
+
+## Rodar local com Docker
+
+Build:
+
+```bash
+docker build -t ffmpeg-playwright-runner .
+```
+
+Run:
+
+```bash
+docker run --rm -p 10000:10000 \
+  -e PORT=10000 \
+  -e PLAYWRIGHT_TOKEN=seu-token-forte \
+  -e ALLOW_DOMAINS="x.com,images.unsplash.com" \
+  -e STORAGE_DIR=/app/storageStates \
+  -e OUTPUT_DIR=/app/outputs \
+  -e TMP_DIR=/app/tmp \
+  ffmpeg-playwright-runner
+```
+
+Healthcheck:
+
+```bash
+curl http://localhost:10000/health
+```

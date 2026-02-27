@@ -10,3 +10,5 @@ coverage/
 *.mp4
 *.tmp
 tmp/
+storageStates/
+outputs/

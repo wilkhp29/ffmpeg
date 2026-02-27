@@ -1,4 +1,4 @@
-FROM oven/bun:1.2.22-slim
+FROM mcr.microsoft.com/playwright:v1.56.0-noble
 
 WORKDIR /app
 
@@ -7,12 +7,13 @@ RUN apt-get update \
   && rm -rf /var/lib/apt/lists/*
 
 COPY package.json ./
-RUN bun install --production
+RUN npm install --omit=dev --no-audit --no-fund
 
 COPY . .
 
 ENV NODE_ENV=production
+ENV PORT=10000
 
-EXPOSE 3000
+EXPOSE 10000
 
-CMD ["bun", "run", "start"]
+CMD ["npm", "run", "start"]

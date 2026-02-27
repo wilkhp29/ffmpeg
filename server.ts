@@ -9,6 +9,23 @@ const { Readable, Transform } = require('node:stream') as typeof import('node:st
 const crypto = require('node:crypto') as typeof import('node:crypto');
 
 import type { NextFunction, Request, Response } from 'express';
+import type { PlaywrightJobError } from './playwright/errors';
+
+const { runPlaywrightJob } = require('./playwright/runner') as typeof import('./playwright/runner');
+const {
+  PlaywrightHttpError,
+  PlaywrightJobError: PlaywrightJobErrorCtor
+} = require('./playwright/errors') as typeof import('./playwright/errors');
+const {
+  ensurePlaywrightDirectories,
+  resolveArtifactPath,
+  saveRawStorageState
+} = require('./playwright/storage') as typeof import('./playwright/storage');
+const {
+  parseAllowDomains,
+  parseRunRequestBody,
+  validateSessionName
+} = require('./playwright/validators') as typeof import('./playwright/validators');
 
 type RenderRequestBody = {
   audio_url?: unknown;
@@ -127,6 +144,16 @@ const OUTPUT_ROUTE_PREFIX = '/outputs';
 const GOOGLE_TTS_BASE_URL =
   'https://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob&tl=pt-BR&q=';
 const GOOGLE_TTS_MAX_CHARS = parsePositiveInteger(process.env.GOOGLE_TTS_MAX_CHARS, 180);
+const PLAYWRIGHT_TOKEN = String(process.env.PLAYWRIGHT_TOKEN || '').trim();
+const PLAYWRIGHT_ALLOW_DOMAINS = parseAllowDomains(process.env.ALLOW_DOMAINS);
+const PLAYWRIGHT_MAX_ACTIONS = parsePositiveInteger(process.env.MAX_ACTIONS, 50);
+const PLAYWRIGHT_DEFAULT_TIMEOUT_MS = parsePositiveInteger(process.env.DEFAULT_TIMEOUT_MS, 60_000);
+const PLAYWRIGHT_STORAGE_DIR = process.env.STORAGE_DIR || path.join(process.cwd(), 'storageStates');
+const PLAYWRIGHT_OUTPUT_DIR = process.env.OUTPUT_DIR || path.join(process.cwd(), 'outputs');
+const PLAYWRIGHT_TMP_DIR = process.env.TMP_DIR || path.join(os.tmpdir(), 'playwright-runner-tmp');
+const PLAYWRIGHT_ARTIFACTS_ROUTE_PREFIX = '/playwright/artifacts';
+const PLAYWRIGHT_UPLOAD_MAX_BYTES = 10 * 1024 * 1024;
+const PLAYWRIGHT_UPLOAD_DOWNLOAD_TIMEOUT_MS = 30_000;
 
 const ALLOWED_AUDIO_TYPES = new Set(['audio/mpeg', 'application/octet-stream']);
 const ALLOWED_IMAGE_TYPES = new Set(['image/jpeg', 'image/png']);
@@ -138,8 +165,23 @@ let outputRootReady: Promise<void> | undefined;
 app.disable('x-powered-by');
 app.use(express.json({ limit: '256kb' }));
 
+if (!PLAYWRIGHT_TOKEN) {
+  throw new Error('PLAYWRIGHT_TOKEN e obrigatorio para habilitar endpoints /playwright/*.');
+}
+
 app.get('/health', (_req: Request, res: Response) => {
-  res.status(200).json({ status: 'ok' });
+  res.status(200).json({
+    status: 'ok',
+    services: {
+      ffmpeg: 'ok',
+      playwright: 'ok'
+    },
+    playwright: {
+      allow_domains: PLAYWRIGHT_ALLOW_DOMAINS,
+      max_actions: PLAYWRIGHT_MAX_ACTIONS,
+      default_timeout_ms: PLAYWRIGHT_DEFAULT_TIMEOUT_MS
+    }
+  });
 });
 
 app.get('/', (_req: Request, res: Response) => {
@@ -183,6 +225,195 @@ app.get(`${OUTPUT_ROUTE_PREFIX}/:filename`, async (req: Request, res: Response) 
     res.status(500).json({ error: 'Falha ao enviar arquivo.' });
   });
 });
+
+app.post('/playwright/run', requirePlaywrightAuth, async (req: Request, res: Response) => {
+  try {
+    const parsedRequest = parseRunRequestBody(req.body, {
+      maxActions: PLAYWRIGHT_MAX_ACTIONS,
+      defaultTimeoutMs: PLAYWRIGHT_DEFAULT_TIMEOUT_MS,
+      allowDomains: PLAYWRIGHT_ALLOW_DOMAINS
+    });
+
+    console.log(
+      `[playwright] start actions=${parsedRequest.actions.length} session=${parsedRequest.session || '-'}`
+    );
+
+    const result = await runPlaywrightJob(parsedRequest, {
+      allowDomains: PLAYWRIGHT_ALLOW_DOMAINS,
+      storageDir: PLAYWRIGHT_STORAGE_DIR,
+      outputDir: PLAYWRIGHT_OUTPUT_DIR,
+      tmpDir: PLAYWRIGHT_TMP_DIR,
+      artifactsRoutePrefix: PLAYWRIGHT_ARTIFACTS_ROUTE_PREFIX,
+      defaultTimeoutMs: PLAYWRIGHT_DEFAULT_TIMEOUT_MS,
+      maxUploadBytes: PLAYWRIGHT_UPLOAD_MAX_BYTES,
+      maxUploadDownloadTimeoutMs: PLAYWRIGHT_UPLOAD_DOWNLOAD_TIMEOUT_MS
+    });
+
+    console.log(`[playwright] success job=${result.jobId} took_ms=${result.tookMs}`);
+    return res.status(200).json(result);
+  } catch (error: unknown) {
+    if (error instanceof PlaywrightHttpError) {
+      return res.status(error.statusCode).json({
+        ok: false,
+        error: error.message,
+        ...(error.details ? { details: error.details } : {})
+      });
+    }
+
+    if (error instanceof PlaywrightJobErrorCtor) {
+      const jobError = error as PlaywrightJobError;
+      return res.status(jobError.statusCode).json({
+        ok: false,
+        jobId: jobError.jobId,
+        tookMs: jobError.tookMs,
+        error: jobError.message,
+        ...(jobError.details ? { details: jobError.details } : {}),
+        logs: jobError.logs
+      });
+    }
+
+    console.error('[playwright] unexpected error', error);
+    return res.status(500).json({
+      ok: false,
+      error: 'Falha inesperada ao executar Playwright job.'
+    });
+  }
+});
+
+app.post('/playwright/save-state', requirePlaywrightAuth, async (req: Request, res: Response) => {
+  try {
+    if (!req.body || typeof req.body !== 'object' || Array.isArray(req.body)) {
+      throw new PlaywrightHttpError(400, 'Body invalido.');
+    }
+
+    const payload = req.body as Record<string, unknown>;
+    const session = validateSessionName(payload.session, 'session');
+
+    if (payload.storageState !== undefined) {
+      if (!payload.storageState || typeof payload.storageState !== 'object') {
+        throw new PlaywrightHttpError(400, 'Campo "storageState" deve ser objeto JSON.');
+      }
+
+      const filePath = await saveRawStorageState(
+        PLAYWRIGHT_STORAGE_DIR,
+        session,
+        payload.storageState
+      );
+
+      return res.status(200).json({
+        ok: true,
+        session,
+        file: path.basename(filePath)
+      });
+    }
+
+    const actions: unknown[] = Array.isArray(payload.actions)
+      ? payload.actions
+      : Array.isArray(payload.commands)
+        ? payload.commands
+        : [];
+
+    const parsedRequest = parseRunRequestBody(
+      {
+        session,
+        timeoutMs: payload.timeoutMs,
+        actions: [...actions, { action: 'saveStorage', session }]
+      },
+      {
+        maxActions: PLAYWRIGHT_MAX_ACTIONS,
+        defaultTimeoutMs: PLAYWRIGHT_DEFAULT_TIMEOUT_MS,
+        allowDomains: PLAYWRIGHT_ALLOW_DOMAINS
+      }
+    );
+
+    const result = await runPlaywrightJob(parsedRequest, {
+      allowDomains: PLAYWRIGHT_ALLOW_DOMAINS,
+      storageDir: PLAYWRIGHT_STORAGE_DIR,
+      outputDir: PLAYWRIGHT_OUTPUT_DIR,
+      tmpDir: PLAYWRIGHT_TMP_DIR,
+      artifactsRoutePrefix: PLAYWRIGHT_ARTIFACTS_ROUTE_PREFIX,
+      defaultTimeoutMs: PLAYWRIGHT_DEFAULT_TIMEOUT_MS,
+      maxUploadBytes: PLAYWRIGHT_UPLOAD_MAX_BYTES,
+      maxUploadDownloadTimeoutMs: PLAYWRIGHT_UPLOAD_DOWNLOAD_TIMEOUT_MS
+    });
+
+    return res.status(200).json(result);
+  } catch (error: unknown) {
+    if (error instanceof PlaywrightHttpError) {
+      return res.status(error.statusCode).json({
+        ok: false,
+        error: error.message,
+        ...(error.details ? { details: error.details } : {})
+      });
+    }
+
+    if (error instanceof PlaywrightJobErrorCtor) {
+      const jobError = error as PlaywrightJobError;
+      return res.status(jobError.statusCode).json({
+        ok: false,
+        jobId: jobError.jobId,
+        tookMs: jobError.tookMs,
+        error: jobError.message,
+        ...(jobError.details ? { details: jobError.details } : {}),
+        logs: jobError.logs
+      });
+    }
+
+    console.error('[playwright] save-state unexpected error', error);
+    return res.status(500).json({
+      ok: false,
+      error: 'Falha inesperada ao salvar storageState.'
+    });
+  }
+});
+
+app.get(
+  '/playwright/artifacts/:jobId/:filename',
+  requirePlaywrightAuth,
+  async (req: Request, res: Response) => {
+    const jobId = String(req.params.jobId || '').trim();
+    const filename = String(req.params.filename || '').trim();
+
+    let artifactPath = '';
+    try {
+      artifactPath = resolveArtifactPath(PLAYWRIGHT_OUTPUT_DIR, jobId, filename);
+    } catch (error: unknown) {
+      if (error instanceof PlaywrightHttpError) {
+        return res.status(error.statusCode).json({ ok: false, error: error.message });
+      }
+
+      return res.status(400).json({ ok: false, error: 'Caminho de artefato invalido.' });
+    }
+
+    try {
+      const stat = await fs.stat(artifactPath);
+      if (!stat.isFile()) {
+        return res.status(404).json({ ok: false, error: 'Artefato nao encontrado.' });
+      }
+    } catch {
+      return res.status(404).json({ ok: false, error: 'Artefato nao encontrado.' });
+    }
+
+    const contentType = resolveArtifactContentType(filename);
+    if (contentType) {
+      res.setHeader('Content-Type', contentType);
+    }
+
+    res.setHeader('Cache-Control', 'private, max-age=86400');
+    return res.sendFile(artifactPath, (error: NodeJS.ErrnoException | null) => {
+      if (!error || res.headersSent) {
+        return;
+      }
+
+      if (error.code === 'ENOENT') {
+        res.status(404).json({ ok: false, error: 'Artefato nao encontrado.' });
+        return;
+      }
+
+      res.status(500).json({ ok: false, error: 'Falha ao enviar artefato.' });
+    });
+  }
+);
 
 app.post('/render', async (req: Request<unknown, unknown, RenderRequestBody>, res: Response) => {
   pruneJobCache();
@@ -434,6 +665,58 @@ app.post('/render', async (req: Request<unknown, unknown, RenderRequestBody>, re
   }
 });
 
+function requirePlaywrightAuth(req: Request, res: Response, next: NextFunction): void {
+  const authHeader = String(req.header('Authorization') || '').trim();
+
+  if (!authHeader.toLowerCase().startsWith('bearer ')) {
+    res.status(401).json({ ok: false, error: 'Nao autorizado.' });
+    return;
+  }
+
+  const token = authHeader.slice(7).trim();
+  if (!token || !isTokenEqual(token, PLAYWRIGHT_TOKEN)) {
+    res.status(401).json({ ok: false, error: 'Nao autorizado.' });
+    return;
+  }
+
+  next();
+}
+
+function isTokenEqual(value: string, expected: string): boolean {
+  const a = Buffer.from(value, 'utf8');
+  const b = Buffer.from(expected, 'utf8');
+
+  if (a.length !== b.length) {
+    return false;
+  }
+
+  return crypto.timingSafeEqual(a, b);
+}
+
+function resolveArtifactContentType(filename: string): string | undefined {
+  const ext = path.extname(filename).toLowerCase();
+
+  switch (ext) {
+    case '.png':
+      return 'image/png';
+    case '.jpg':
+    case '.jpeg':
+      return 'image/jpeg';
+    case '.webp':
+      return 'image/webp';
+    case '.gif':
+      return 'image/gif';
+    case '.bmp':
+      return 'image/bmp';
+    case '.txt':
+      return 'text/plain; charset=utf-8';
+    case '.json':
+      return 'application/json; charset=utf-8';
+    default:
+      return undefined;
+  }
+}
+
 app.use((_req: Request, res: Response) => {
   res.status(404).json({ error: 'Rota nao encontrada.' });
 });
@@ -457,6 +740,14 @@ app.listen(PORT, () => {
 
 void ensureOutputRoot().catch((error: unknown) => {
   console.error('[startup] failed to prepare output directory', error);
+});
+
+void ensurePlaywrightDirectories({
+  storageDir: PLAYWRIGHT_STORAGE_DIR,
+  outputDir: PLAYWRIGHT_OUTPUT_DIR,
+  tmpDir: PLAYWRIGHT_TMP_DIR
+}).catch((error: unknown) => {
+  console.error('[startup] failed to prepare playwright directories', error);
 });
 
 const cleanupInterval = setInterval(() => {

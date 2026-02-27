@@ -6,7 +6,9 @@
   "type": "commonjs",
   "packageManager": "bun@1.2.22",
   "scripts": {
-    "start": "bun server.ts",
+    "start": "tsx server.ts",
+    "start:bun": "bun server.ts",
+    "save-state": "node tools/save_state.js",
     "typecheck": "tsc --noEmit"
   },
   "keywords": [
@@ -22,6 +24,8 @@
     "typescript": "^5.9.2"
   },
   "dependencies": {
-    "express": "^4.21.2"
+    "express": "^4.21.2",
+    "playwright": "^1.56.0",
+    "tsx": "^4.20.6"
   }
 }
