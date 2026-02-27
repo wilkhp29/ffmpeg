@@ -400,11 +400,12 @@ async function executeAction(options: {
     }
 
     case 'evaluate': {
+      appendLog(logs, `[step] evaluate script=[${action.script}] arg=${JSON.stringify(action.arg)}`);
       const result = await page.evaluate(action.script, action.arg);
       if (action.key) {
         outputs.extracted[action.key] = result;
       }
-      appendLog(logs, `[step] evaluate script_len=${action.script.length} result=${JSON.stringify(result)}`);
+      appendLog(logs, `[step] evaluate result=${JSON.stringify(result)}`);
       return;
     }
 
